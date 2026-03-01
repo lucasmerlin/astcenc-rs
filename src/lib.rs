@@ -67,6 +67,7 @@ fn error_code_to_result(code: astcenc_sys::astcenc_error) -> Result<(), Error> {
 pub struct Context {
     inner: NonNull<astcenc_sys::astcenc_context>,
     config: Config,
+    threads: usize,
 }
 
 unsafe impl Sync for Context {}
@@ -480,6 +481,7 @@ impl Context {
         Ok(Self {
             inner: unsafe { NonNull::new(cfg.assume_init()).ok_or(Error::Unknown)? },
             config,
+            threads,
         })
     }
 
@@ -539,15 +541,60 @@ impl Context {
             data: image_data_pointers.as_mut_ptr() as *mut *mut _,
         };
 
-        error_code_to_result(unsafe {
-            astcenc_sys::astcenc_compress_image(
-                self.inner.as_mut(),
-                &mut image_sys as *mut _,
-                &swizzle.into_sys(),
-                out.as_mut_ptr(),
-                bytes,
-                0,
-            )
+        let swizzle_sys = swizzle.into_sys();
+
+        // SAFETY: astcenc_compress_image is designed to be called from multiple threads
+        // simultaneously with different thread_index values. The C library internally
+        // synchronizes access via thread barriers. All pointers remain valid for the
+        // duration of the scope.
+        let ctx_ptr = self.inner.as_ptr();
+        let image_ptr = &mut image_sys as *mut astcenc_sys::astcenc_image;
+        let swizzle_ptr = &swizzle_sys as *const astcenc_sys::astcenc_swizzle;
+        let out_ptr = out.as_mut_ptr();
+        let thread_count = self.threads;
+
+        // SAFETY: astcenc_compress_image is designed to be called from multiple threads
+        // simultaneously with different thread_index values. The C library internally
+        // synchronizes access via thread barriers. All pointers remain valid for the
+        // duration of the scope.
+        struct CompressArgs {
+            ctx: *mut astcenc_sys::astcenc_context,
+            image: *mut astcenc_sys::astcenc_image,
+            swizzle: *const astcenc_sys::astcenc_swizzle,
+            out: *mut u8,
+        }
+        unsafe impl Send for CompressArgs {}
+        unsafe impl Sync for CompressArgs {}
+
+        let args = CompressArgs {
+            ctx: ctx_ptr,
+            image: image_ptr,
+            swizzle: swizzle_ptr,
+            out: out_ptr,
+        };
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..thread_count)
+                .map(|thread_index| {
+                    let args = &args;
+                    s.spawn(move || unsafe {
+                        astcenc_sys::astcenc_compress_image(
+                            args.ctx,
+                            args.image,
+                            args.swizzle,
+                            args.out,
+                            bytes,
+                            thread_index as u32,
+                        )
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                error_code_to_result(handle.join().unwrap())?;
+            }
+
+            Ok::<(), Error>(())
         })?;
 
         unsafe { out.set_len(bytes) };
